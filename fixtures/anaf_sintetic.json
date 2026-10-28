@@ -1,0 +1,23 @@
+{
+  "cod": 200,
+  "message": "SUCCESS",
+  "found": [
+    {
+      "date_generale": {
+        "cui": 1234567,
+        "denumire": "SOCIETATE TEST ȘI ÎNCERCĂRI SRL",
+        "nrRegCom": "J00/123/2020"
+      },
+      "adresa_sediu_social": {
+        "sdenumire_Localitate": "Mun. Brașov",
+        "sdenumire_Strada": "Str. Școlii",
+        "snumar_Strada": "12A",
+        "scod_Localitate": "000316",
+        "sdenumire_Judet": "BRAȘOV",
+        "sdetalii_Adresa": "Clădirea Â, etaj Ț",
+        "scod_Postal": "001234"
+      }
+    }
+  ],
+  "notFound": [7654321]
+}

@@ -1,0 +1,38 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Date locale ale companiei si baze SQLite
+/data/private/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+*.csv
+!fixtures/*.csv
+
+# Setari/secrete si artefacte locale
+.env
+.env.*
+!.env.example
+/out/
+/reports/
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Fisiere locale excluse din Git
+/57449.json
+/InterogareAnaf-baseline-SQLite.zip
+/README.local.md
