@@ -34,6 +34,10 @@ def open_sqlite(path):
     connection = sqlite3.connect(path, timeout=30)
     try:
         yield connection
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
@@ -42,9 +46,11 @@ class FakeAnafHandler(BaseHTTPRequestHandler):
     calls = []
     call_starts = []
     responses = []
+    response_delay = 0.0
     lock = threading.Lock()
 
     def do_POST(self):
+        request_started = time.monotonic()
         try:
             size = int(self.headers.get("Content-Length", "0"))
             request_body = json.loads(self.rfile.read(size).decode("utf-8"))
@@ -56,11 +62,14 @@ class FakeAnafHandler(BaseHTTPRequestHandler):
             return
         with self.lock:
             self.calls.append(request_body)
-            self.call_starts.append(time.monotonic())
+            self.call_starts.append(request_started)
             if self.responses:
                 status, body, headers = self.responses.pop(0)
             else:
                 status, body, headers = 200, None, {}
+            delay = self.response_delay
+        if delay:
+            time.sleep(delay)
         if body is None and status == 200:
             body = json.dumps(FIXTURE, ensure_ascii=False).encode("utf-8")
         elif isinstance(body, str):
@@ -75,7 +84,7 @@ class FakeAnafHandler(BaseHTTPRequestHandler):
         if body is not None:
             try:
                 self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
     def log_message(self, *_args):
@@ -99,6 +108,10 @@ class TestBaselineSchema(unittest.TestCase):
             self.assertEqual(partner_columns[0][5], 1)
             history_columns = connection.execute("PRAGMA table_info(istoric_verificari)").fetchall()
             self.assertEqual(tuple(row[1] for row in history_columns), EXPECTED_HISTORY_COLUMNS)
+            self.assertEqual(tuple(row[2].upper() for row in history_columns), (
+                "INTEGER", "INTEGER", "TEXT", "TEXT", "TEXT", "INTEGER",
+                "INTEGER", "TEXT", "INTEGER", "TEXT", "TEXT",
+            ))
             self.assertEqual(
                 connection.execute("PRAGMA foreign_key_list(istoric_verificari)").fetchone()[2],
                 "parteneri",
@@ -148,6 +161,7 @@ class TestCliOfflineContract(unittest.TestCase):
             FakeAnafHandler.calls.clear()
             FakeAnafHandler.call_starts.clear()
             FakeAnafHandler.responses.clear()
+            FakeAnafHandler.response_delay = 0.0
 
     def cli(self, *args, expected_returncode=0):
         environment = os.environ.copy()
@@ -224,7 +238,7 @@ class TestCliOfflineContract(unittest.TestCase):
         self.assertEqual([x["cui"] for x in calls[-1]], [7654321])
         with open_sqlite(self.dbpath) as db:
             history = db.execute(
-                "SELECT cui,resultado,rulare_id FROM istoric_verificari ORDER BY id"
+                "SELECT cui,rezultat,rulare_id FROM istoric_verificari ORDER BY id"
             ).fetchall()
             self.assertEqual(len(history), 3)
             self.assertEqual(history[-1][0:2], (7654321, "NEGASIT"))
@@ -312,6 +326,68 @@ class TestCliOfflineContract(unittest.TestCase):
             self.assertEqual(db.execute(
                 "SELECT denumire_anaf FROM parteneri WHERE cui=1234567"
             ).fetchone()[0], "Valoare valida")
+
+    def test_permanent_http_error_is_logged_once_and_preserves_data(self):
+        self.init_and_import()
+        with open_sqlite(self.dbpath) as db:
+            db.execute("UPDATE parteneri SET denumire_anaf='Valoare valida' WHERE cui=1234567")
+        with FakeAnafHandler.lock:
+            FakeAnafHandler.responses.append((400, b"bad request", {}))
+        self.run_cli(expected_returncode=1)
+        with open_sqlite(self.dbpath) as db:
+            rows = db.execute(
+                "SELECT rezultat,http_status,cod_eroare,nr_incercare FROM istoric_verificari"
+            ).fetchall()
+            self.assertEqual(rows, [
+                ("EROARE", 400, "HTTP_400", 1), ("EROARE", 400, "HTTP_400", 1),
+            ])
+            self.assertEqual(db.execute(
+                "SELECT denumire_anaf FROM parteneri WHERE cui=1234567"
+            ).fetchone()[0], "Valoare valida")
+
+    def test_timeout_retries_are_logged_for_every_cui(self):
+        self.init_and_import()
+        with open_sqlite(self.dbpath) as db:
+            db.execute("UPDATE parteneri SET denumire_anaf='Valoare valida' WHERE cui=1234567")
+        with FakeAnafHandler.lock:
+            FakeAnafHandler.response_delay = 0.15
+        self.run_cli("--timeout", "0.02", expected_returncode=1)
+        with open_sqlite(self.dbpath) as db:
+            rows = db.execute(
+                "SELECT cui,nr_incercare,rezultat,http_status,cod_eroare FROM istoric_verificari "
+                "ORDER BY nr_incercare,cui"
+            ).fetchall()
+            self.assertEqual(len(rows), 6)
+            self.assertEqual({row[2] for row in rows}, {"EROARE"})
+            self.assertEqual({row[3] for row in rows}, {None})
+            self.assertEqual({row[4] for row in rows}, {"TIMEOUT"})
+            self.assertEqual({row[1] for row in rows}, {1, 2, 3})
+            self.assertEqual(db.execute(
+                "SELECT denumire_anaf FROM parteneri WHERE cui=1234567"
+            ).fetchone()[0], "Valoare valida")
+
+    def test_init_db_migrates_legacy_file_without_losing_partners(self):
+        self.dbpath.parent.mkdir(parents=True, exist_ok=True)
+        schema = SCHEMA.read_text(encoding="utf-8")
+        legacy_schema = schema.split("-- Istoric append-only:", 1)[0]
+        with open_sqlite(self.dbpath) as db:
+            db.executescript(legacy_schema)
+            db.execute(
+                "INSERT INTO parteneri(cui,denumire_initiala) VALUES (1234567,'Legacy name')"
+            )
+        self.cli("init-db", "--db", self.dbpath)
+        self.cli("init-db", "--db", self.dbpath)
+        with open_sqlite(self.dbpath) as db:
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )}
+            self.assertEqual(tables, {"parteneri", "istoric_verificari"})
+            self.assertEqual(db.execute(
+                "SELECT cui,denumire_initiala FROM parteneri"
+            ).fetchall(), [(1234567, "Legacy name")])
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM istoric_verificari"
+            ).fetchone()[0], 0)
 
     def test_four_thousand_cuis_make_forty_requests_of_at_most_one_hundred(self):
         self.cli("init-db", "--db", self.dbpath)
