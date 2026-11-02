@@ -16,7 +16,9 @@ from interogare_anaf.client import (
     AnafClient, BatchResponse, RequestFailure, RequestPacer, apply_payload,
 )
 from interogare_anaf.cli import _run
-from interogare_anaf.storage import import_cui, initialize_database
+from interogare_anaf.storage import (
+    HistoryEntry, import_cui, initialize_database, persist_attempt,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = json.loads((ROOT / "fixtures" / "anaf_sintetic.json").read_text(encoding="utf-8"))
@@ -73,6 +75,19 @@ class AdditionalOfflineTests(unittest.TestCase):
         self.db = self.root / "nested" / "parteneri.sqlite3"
         initialize_database(self.db)
 
+    def apply_and_persist(self, requested, payload):
+        result = apply_payload(requested, payload)
+        timestamp = "2026-11-02T10:00:00.000000Z"
+        entries = [HistoryEntry(
+            cui=cui, rulare_id="test-run", incercat_la=timestamp,
+            data_interogarii="2026-11-02", nr_lot=1, nr_incercare=1,
+            rezultat=outcome.result, http_status=200,
+            cod_eroare=outcome.error_code, mesaj_eroare=outcome.error_message,
+            values=outcome.values,
+        ) for cui, outcome in result.outcomes.items()]
+        persist_attempt(self.db, entries)
+        return result
+
     def test_import_skips_invalid_and_preserves_anaf_and_nonempty_initial_name(self):
         with sqlite3.connect(self.db) as connection:
             connection.execute(
@@ -121,7 +136,7 @@ class AdditionalOfflineTests(unittest.TestCase):
             ],
             "notFound": [],
         }
-        result = apply_payload(self.db, [1234567, 7654321], payload)
+        result = self.apply_and_persist([1234567, 7654321], payload)
         self.assertEqual((result.found, result.not_found, result.incomplete), (0, 0, 2))
         self.assertGreaterEqual(result.anomalies, 3)
         with sqlite3.connect(self.db) as connection:
@@ -146,7 +161,7 @@ class AdditionalOfflineTests(unittest.TestCase):
             }],
             "notFound": [],
         }
-        result = apply_payload(self.db, [1234567], payload)
+        result = self.apply_and_persist([1234567], payload)
         self.assertEqual(result.found, 1)
         with sqlite3.connect(self.db) as connection:
             row = connection.execute(
@@ -155,6 +170,43 @@ class AdditionalOfflineTests(unittest.TestCase):
             ).fetchone()
         connection.close()
         self.assertEqual(row, ("Initial", "Noua Si Firma", None, None, None, "000001"))
+
+    def test_found_update_rolls_back_if_history_insert_fails(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute(
+                "INSERT INTO parteneri(cui, denumire_anaf) VALUES (1234567, 'Valoare veche')"
+            )
+            connection.execute(
+                """CREATE TRIGGER reject_history BEFORE INSERT ON istoric_verificari
+                   BEGIN SELECT RAISE(ABORT, 'synthetic history failure'); END"""
+            )
+        connection.close()
+        payload = {
+            "found": [{
+                "date_generale": {"cui": 1234567, "denumire": "Valoare noua"},
+                "adresa_sediu_social": {},
+            }],
+            "notFound": [],
+        }
+        classified = apply_payload([1234567], payload)
+        outcome = classified.outcomes[1234567]
+        entry = HistoryEntry(
+            cui=1234567, rulare_id="atomic-test", incercat_la="2026-11-02T10:00:00Z",
+            data_interogarii="2026-11-02", nr_lot=1, nr_incercare=1,
+            rezultat=outcome.result, http_status=200, values=outcome.values,
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            persist_attempt(self.db, [entry])
+        with sqlite3.connect(self.db) as connection:
+            value = connection.execute(
+                "SELECT denumire_anaf FROM parteneri WHERE cui=1234567"
+            ).fetchone()[0]
+            history_count = connection.execute(
+                "SELECT COUNT(*) FROM istoric_verificari"
+            ).fetchone()[0]
+        connection.close()
+        self.assertEqual(value, "Valoare veche")
+        self.assertEqual(history_count, 0)
 
     def test_retry_after_and_server_errors_obey_pacing(self):
         RetryHandler.attempts = 0
@@ -176,7 +228,7 @@ class AdditionalOfflineTests(unittest.TestCase):
         self.assertEqual(client.request_count, 3)
         self.assertEqual([attempt for attempt, _ in RetryHandler.request_times], [1, 2, 3])
         self.assertTrue(all(len(body) <= 100 for _, body in RetryHandler.request_times))
-        self.assertEqual(fake_time.now, 3.0)
+        self.assertEqual(fake_time.now, 3.1)
         self.assertEqual(response.payload["found"][0]["date_generale"]["cui"], 1234567)
 
     def test_timeout_retries_three_times_but_permanent_http_and_bad_json_do_not(self):
@@ -196,7 +248,7 @@ class AdditionalOfflineTests(unittest.TestCase):
         with self.assertRaisesRegex(RequestFailure, "dupa 3 incercari"):
             timeout_client.fetch([1234567], "2026-10-28")
         self.assertEqual(timeout_opener.calls, 3)
-        self.assertEqual(fake_time.now, 3.0)
+        self.assertEqual(fake_time.now, 3.1)
 
         class PermanentOpener:
             calls = 0
@@ -248,11 +300,14 @@ class AdditionalOfflineTests(unittest.TestCase):
                 self.sizes = []
                 self.cuis = []
 
-            def fetch(self, batch, _query_date):
+            def fetch(self, batch, _query_date, on_error_attempt=None):
                 self.request_count += 1
                 self.sizes.append(len(batch))
                 self.cuis.extend(batch)
-                return BatchResponse({"found": [], "notFound": list(batch)}, 1)
+                return BatchResponse(
+                    {"found": [], "notFound": list(batch)}, 1, 200,
+                    "2026-11-02T10:00:00.000000Z",
+                )
 
         fake_client = FakeClient()
         args = Namespace(db=self.db, only_missing=False, api_url="http://127.0.0.1/unused",

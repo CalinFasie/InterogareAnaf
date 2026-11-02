@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 import re
 import sqlite3
+from dataclasses import dataclass
 
 from .normalization import normalize_text
 
@@ -14,6 +15,24 @@ _ASCII_DIGITS = re.compile(r"[0-9]+\Z")
 
 class DatabaseError(Exception):
     """A missing or unusable application database."""
+
+
+@dataclass(frozen=True)
+class HistoryEntry:
+    cui: int
+    rulare_id: str
+    incercat_la: str
+    data_interogarii: str
+    nr_lot: int
+    nr_incercare: int
+    rezultat: str
+    http_status: int | None = None
+    cod_eroare: str | None = None
+    mesaj_eroare: str | None = None
+    values: tuple[str | None, ...] | None = None
+
+
+_HISTORY_RESULTS = {"GASIT", "NEGASIT", "EROARE", "INCOMPLET"}
 
 
 def initialize_database(path: Path) -> None:
@@ -32,6 +51,7 @@ def connect_existing(path: Path) -> sqlite3.Connection:
         raise DatabaseError(f"Baza de date nu exista: {path}. Ruleaza mai intai init-db.")
     connection = sqlite3.connect(path, timeout=30)
     connection.isolation_level = None  # fiecare INSERT/UPDATE este atomic
+    connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
@@ -95,17 +115,36 @@ def load_cuis(path: Path, only_missing: bool = False) -> list[int]:
         connection.close()
 
 
-def update_anaf_fields(path: Path, cui: int, values: tuple[str | None, ...]) -> None:
-    if len(values) != 9:
-        raise ValueError("Sunt necesare exact noua campuri ANAF")
+def persist_attempt(path: Path, entries: list[HistoryEntry]) -> None:
+    """Persist one CUI row per outcome; commit GASIT data and history together."""
     connection = connect_existing(path)
     try:
-        connection.execute(
-            """UPDATE parteneri SET denumire_anaf=?, nrRegCom=?,
-               sdenumire_Localitate=?, sdenumire_Strada=?, snumar_Strada=?,
-               scod_Localitate=?, sdenumire_Judet=?, sdetalii_Adresa=?, scod_Postal=?
-               WHERE cui=?""",
-            (*values, cui),
-        )
+        connection.execute("BEGIN IMMEDIATE")
+        for entry in entries:
+            if entry.rezultat not in _HISTORY_RESULTS:
+                raise ValueError(f"Rezultat de istoric invalid: {entry.rezultat}")
+            if entry.rezultat == "GASIT":
+                if entry.values is None or len(entry.values) != 9:
+                    raise ValueError("Rezultatul GASIT necesita exact noua valori ANAF")
+                connection.execute(
+                    """UPDATE parteneri SET denumire_anaf=?, nrRegCom=?,
+                       sdenumire_Localitate=?, sdenumire_Strada=?, snumar_Strada=?,
+                       scod_Localitate=?, sdenumire_Judet=?, sdetalii_Adresa=?, scod_Postal=?
+                       WHERE cui=?""",
+                    (*entry.values, entry.cui),
+                )
+            connection.execute(
+                """INSERT INTO istoric_verificari
+                   (cui,rulare_id,incercat_la,data_interogarii,nr_lot,nr_incercare,
+                    rezultat,http_status,cod_eroare,mesaj_eroare)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (entry.cui, entry.rulare_id, entry.incercat_la, entry.data_interogarii,
+                 entry.nr_lot, entry.nr_incercare, entry.rezultat, entry.http_status,
+                 entry.cod_eroare, entry.mesaj_eroare),
+            )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
     finally:
         connection.close()

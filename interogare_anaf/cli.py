@@ -6,12 +6,16 @@ import math
 from pathlib import Path
 import sqlite3
 import sys
+import uuid
 
 from .client import (
-    DEFAULT_API_URL, MAX_BATCH_SIZE, AnafClient, ProtocolFailure,
-    RequestFailure, apply_payload,
+    DEFAULT_API_URL, MAX_BATCH_SIZE, AnafClient, AttemptEvent, CuiOutcome,
+    ProtocolFailure, RequestFailure, apply_payload,
 )
-from .storage import DatabaseError, import_cui, initialize_database, load_cuis
+from .storage import (
+    DatabaseError, HistoryEntry, import_cui, initialize_database, load_cuis,
+    persist_attempt,
+)
 
 
 def _positive_float(value: str) -> float:
@@ -58,33 +62,65 @@ def _run(args: argparse.Namespace) -> int:
     cuis = load_cuis(args.db, only_missing=args.only_missing)
     batches = [cuis[offset:offset + MAX_BATCH_SIZE]
                for offset in range(0, len(cuis), MAX_BATCH_SIZE)]
-    print(f"CUI citite din SQLite: {len(cuis)}; loturi: {len(batches)}.")
+    run_id = str(uuid.uuid4())
+    print(f"Rulare {run_id}; CUI citite din SQLite: {len(cuis)}; loturi: {len(batches)}.")
     if not batches:
         return 0
 
     client = AnafClient(api_url=args.api_url, timeout=args.timeout)
     totals = {"found": 0, "not_found": 0, "incomplete": 0,
-              "failed": 0, "anomalies": 0}
+              "failed": 0, "anomalies": 0, "error_records": 0}
     for index, batch in enumerate(batches, start=1):
+        def record_error_attempt(event: AttemptEvent) -> None:
+            entries = [HistoryEntry(
+                cui=cui, rulare_id=run_id, incercat_la=event.attempted_at,
+                data_interogarii=args.date, nr_lot=index, nr_incercare=event.number,
+                rezultat="EROARE", http_status=event.http_status,
+                cod_eroare=event.error_code, mesaj_eroare=event.error_message,
+            ) for cui in batch]
+            persist_attempt(args.db, entries)
+            totals["error_records"] += len(entries)
+
         try:
-            response = client.fetch(batch, args.date)
-            result = apply_payload(args.db, batch, response.payload)
-            totals["found"] += result.found
-            totals["not_found"] += result.not_found
-            totals["incomplete"] += result.incomplete
-            totals["anomalies"] += result.anomalies
-            print(f"Lot {index}/{len(batches)}: gasite={result.found}, "
-                  f"notFound={result.not_found}, incomplete={result.incomplete}, "
-                  f"anomalii={result.anomalies}.")
-        except (RequestFailure, ProtocolFailure) as exc:
+            response = client.fetch(batch, args.date, on_error_attempt=record_error_attempt)
+            try:
+                result = apply_payload(batch, response.payload)
+            except ProtocolFailure:
+                result = None
+            if result is None:
+                outcomes = {cui: CuiOutcome(
+                    "INCOMPLET", error_code="STRUCTURA_RASPUNS",
+                    error_message="Raspunsul ANAF nu contine liste found si notFound valide.",
+                ) for cui in batch}
+                totals["incomplete"] += len(batch)
+                totals["anomalies"] += 1
+                result_message = "structura raspunsului invalida"
+            else:
+                outcomes = result.outcomes
+                totals["found"] += result.found
+                totals["not_found"] += result.not_found
+                totals["incomplete"] += result.incomplete
+                totals["anomalies"] += result.anomalies
+                result_message = (f"gasite={result.found}, notFound={result.not_found}, "
+                                  f"incomplete={result.incomplete}, anomalii={result.anomalies}")
+            entries = [HistoryEntry(
+                cui=cui, rulare_id=run_id, incercat_la=response.attempted_at,
+                data_interogarii=args.date, nr_lot=index, nr_incercare=response.attempts,
+                rezultat=outcomes[cui].result, http_status=response.http_status,
+                cod_eroare=outcomes[cui].error_code,
+                mesaj_eroare=outcomes[cui].error_message, values=outcomes[cui].values,
+            ) for cui in batch]
+            persist_attempt(args.db, entries)
+            print(f"Lot {index}/{len(batches)} incercarea {response.attempts}: {result_message}.")
+        except RequestFailure as exc:
             totals["failed"] += 1
-            totals["incomplete"] += len(batch)
             print(f"Lot {index}/{len(batches)} esuat: {exc}; datele anterioare au fost pastrate.",
                   file=sys.stderr)
     print("Total: " + ", ".join((
-        f"CUI={len(cuis)}", f"loturi procesate={len(batches)}",
+        f"rulare_id={run_id}", f"CUI={len(cuis)}", f"loturi procesate={len(batches)}",
         f"cereri HTTP={client.request_count}", f"gasite={totals['found']}",
         f"notFound={totals['not_found']}", f"incomplete={totals['incomplete']}",
+        f"inregistrari eroare={totals['error_records']}",
         f"loturi esuate={totals['failed']}", f"anomalii={totals['anomalies']}",
     )))
     return 1 if totals["failed"] else 0
