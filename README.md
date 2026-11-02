@@ -1,6 +1,6 @@
 # InterogareAnaf
 
-Aplicatie Python 3.11+ pentru importul CUI-urilor intr-o baza SQLite si actualizarea celor noua campuri selectate din raspunsul ANAF TVA v9. Schema are exact 11 coloane si este definita in `db/schema.sql`; nu sunt stocate alte date ANAF.
+Aplicatie CLI Python 3.11+ care citeste CUI-uri din SQLite, interogheaza ANAF TVA v9 in loturi si actualizeaza numai cele noua campuri ANAF din `parteneri`. Schema are doua tabele: `parteneri` cu exact 11 coloane neschimbate si `istoric_verificari` pentru istoricul append-only al fiecarei incercari.
 
 ## Instalare locala
 
@@ -18,7 +18,7 @@ python3 -m venv .venv
 .venv/bin/python --version
 ```
 
-Comenzile se ruleaza din radacina proiectului folosind interpretul din mediul virtual. Aplicatia nu interogheaza ANAF la instalare sau la `init-db`/`import-cui`.
+Ruleaza comenzile din radacina proiectului cu interpretul din mediul virtual. Instalarea, `init-db` si `import-cui` nu contacteaza ANAF.
 
 ## CLI
 
@@ -29,20 +29,22 @@ python -m interogare_anaf run --db data/private/parteneri.sqlite3 --date 2026-10
 python -m interogare_anaf run --db data/private/parteneri.sqlite3 --date 2026-10-28 --only-missing
 ```
 
-Inlocuieste `python` cu `.venv\Scripts\python.exe` pe Windows sau `.venv/bin/python` pe Ubuntu. CSV-ul de import este UTF-8 ori UTF-8 BOM, cu separator `;` si antet `cui;denumire_initiala`. Randurile invalide se omit si se raporteaza fara a afisa numele firmei. Un nume initial gol la import nu sterge un nume deja stocat.
+Inlocuieste `python` cu `.venv\Scripts\python.exe` pe Windows sau `.venv/bin/python` pe Ubuntu. CSV-ul este UTF-8 ori UTF-8 BOM, cu separator `;` si antet `cui;denumire_initiala`. Randurile invalide se omit si se raporteaza fara numele firmei; un nume initial gol nu sterge numele deja stocat.
 
-`run` accepta si `--api-url URL` pentru servere de test explicite si `--timeout SECUNDE` (implicit 20). Fara `--api-url`, foloseste endpointul oficial. Loturile sunt sortate, de maximum 100 CUI; clientul limiteaza inceputul cererilor la cel mult una pe secunda si reincerca de cel mult doua ori dupa prima incercare pentru timeout, erori de conexiune, HTTP 429 si HTTP 5xx. Testele folosesc loopback si nu contacteaza endpointul oficial.
+`run` accepta `--api-url URL` (implicit endpointul oficial), `--timeout SECUNDE` (implicit 20) si `--only-missing`. Ultima optiune selecteaza numai randurile cu `denumire_anaf IS NULL`, independent de istoric. Loturile au cel mult 100 CUI, cu minimum o secunda intre inceputurile cererilor. Clientul reincerca maximum de doua ori pentru timeout, erori de conexiune, HTTP 429 si HTTP 5xx, cu backoff si `Retry-After`.
 
-Inaintea unei rulari reale, fa un backup al bazei. `run` citeste CUI-urile numai din SQLite; `--only-missing` selecteaza randurile cu `denumire_anaf IS NULL`.
+## Istoric si limite
 
-## Limita de stare
+Fiecare cerere efectiva scrie cate un rand in `istoric_verificari` pentru fiecare CUI din lot. Rezultatele sunt `GASIT`, `NEGASIT`, `EROARE` si `INCOMPLET`; fiecare retry si fiecare executie `run` se pastreaza separat. Succesul actualizeaza cele noua coloane ANAF si adauga istoricul in aceeasi tranzactie SQLite. `notFound`, erorile si raspunsurile incomplete nu sterg valorile ANAF anterioare.
 
-Schema nu are coloana de status sau data verificarii. Prin urmare, baza nu poate deosebi un CUI care nu a fost interogat de unul returnat in `notFound`, si nu poate arata cand s-a facut ultima verificare. `notFound` nu modifica datele ANAF existente; `--only-missing` il poate interoga din nou, la fel ca un rand `found` fara denumire. Aceasta limitare este pastrata intentionat pentru schema de 11 coloane.
+`parteneri` nu contine status sau data verificarii. `--only-missing` nu deduce starea din istoric. Nu se pastreaza JSON-ul integral ANAF ori alte campuri fiscale. Inainte de o rulare reala, fa un backup SQLite.
 
-## Teste offline
+## Contract si teste
 
-```bash
-python -m unittest discover -s tests -v
-```
+- `docs/SPEC.md` — contractul functional si protocolul istoricului.
+- `db/schema.sql` — sursa unica pentru tabele, constrangeri si indexuri.
+- `docs/TEST_PLAN.md` si `tests/test_contract.py` — acceptanta comuna offline.
+- `fixtures/anaf_sintetic.json`, `fixtures/parteneri_sintetici.csv` — date fictive.
+- `AGENTS.md`, `prompts/IMPLEMENTARE.md` — instructiuni comune pentru Codex si OpenCode.
 
-Testele HTTP folosesc doar servere pe `127.0.0.1` si fixture-ul sintetic. Nu ruleaza `run` cu endpointul oficial.
+Ruleaza `python -m unittest discover -s tests -v`. Testele HTTP folosesc numai servere pe `127.0.0.1` si nu contacteaza ANAF. Pe Windows, foloseste `.venv\Scripts\python.exe`; pe Ubuntu, `.venv/bin/python`. Nu comite baze SQLite, CSV-uri private ori directoare `.venv`.
