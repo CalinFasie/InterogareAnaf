@@ -1,45 +1,46 @@
-# TEST_PLAN — criterii comune de acceptanta, fara apeluri ANAF reale
+# TEST_PLAN — contract comun SQLite cu istoric, fara apeluri ANAF reale
 
 ## Reguli
 
-1. `python -m unittest discover -s tests -v` ruleaza offline, numai cu server HTTP simulat pe `127.0.0.1`; un guard interzice conexiuni externe pentru procesele CLI testate.
-2. `fixtures/anaf_sintetic.json` contine date fictive, dar reproduce structura `date_generale`, `adresa_sediu_social`, `found`, `notFound`.
-3. `57449.json` este un exemplu real local pus la dispozitie separat de utilizator; nu se publica in GitHub.
-4. Agentii nu modifica suita comuna. Pot adauga teste in alte fisiere.
+1. Comanda de acceptanta este `python -m unittest discover -s tests -v` si trebuie sa ruleze offline.
+2. HTTP-ul de test foloseste numai servere locale legate la `127.0.0.1`; fixture-urile sunt fictive, iar network guard-ul blocheaza hosturile externe pentru CLI.
+3. Nu se modifica modulul comun de schema sau testele contractuale in timpul implementarii agentilor; testele suplimentare se adauga separat.
+4. Toate conexiunile SQLite deschise de teste se inchid explicit, inclusiv cand folosesc blocuri `with`; context managerul conexiunii nu este un substitut pentru `close()`.
+5. Niciun test nu face cereri catre serviciul ANAF real.
 
-## Cazuri obligatorii
+## Acceptanta comuna
 
-| ID | Test | Rezultat asteptat |
+| ID | Verificare | Rezultat asteptat |
 |---|---|---|
-| T01 | `init-db` pe cale inexistenta | Creeaza DB si exact tabela `parteneri` cu 11 coloane |
-| T02 | `init-db` repetat | Pastreaza toate randurile |
-| T03 | `import-cui` cu CSV fictiv | CUI `INTEGER`, denumiri initiale normalizate |
-| T04 | CUI duplicat in import | Nu dubleaza randurile, nu sterge date ANAF existente |
-| T05 | CUI invalid (gol, negativ, `RO`, fractional, litere) | Respinge randul si raporteaza eroarea |
-| T06 | `found` pentru un CUI | Actualizeaza numai cele 9 coloane ANAF aferente |
-| T07 | `notFound` pentru un CUI | Nu schimba coloanele ANAF, raporteaza in consola |
-| T08 | Diacritice `ăâîșşțţ` si uppercase | Normalizate in caractere latine, inclusiv denumirea initiala |
-| T09 | Cod postal/localitate `001234`/`000316` | Zerourile de la inceput se pastreaza |
-| T10 | `denumire_initiala` diferita de ANAF | Ambele valori raman separate |
-| T11 | Chei ANAF lipsa/sir gol | Coloana lipsa ramane `NULL` dupa `found` valid |
-| T12 | `found` cu CUI strain, duplicat sau invalid | Nu modifica alt CUI; anomalie raportata |
-| T13 | HTTP 429/5xx/timeout | Maximum 3 incercari per lot, pacing si backoff |
-| T14 | HTTP 4xx permanent sau JSON invalid | Nu sterge valori, continua cu celelalte loturi |
-| T15 | Lista `found`/`notFound` incompleta | Nu inventeaza valori; raporteaza CUI nerezolvate |
-| T16 | 101 CUI | Cel putin doua cereri, fiecare cu maximum 100 |
-| T17 | 4.000 CUI | 40 loturi fara retry, nu 4.000 apeluri individuale |
-| T18 | Limita de trafic | Minimum o secunda intre inceputurile a doua cereri, inclusiv retry |
-| T19 | Reexecutare `run` | Rezultate actualizate, denumirea initiala neschimbata |
-| T20 | `--only-missing` | Interogheaza doar randuri cu `denumire_anaf IS NULL` |
-| T21 | Oprire dupa mai multe loturi | Datele deja salvate persista, nu corupe DB |
-| T22 | Raspuns cu alte sectiuni fiscale | Niciun camp suplimentar nu apare in SQLite |
+| T01 | Schema aplicata din `db/schema.sql` | Exact tabelele `parteneri`, `istoric_verificari`; fara alte tabele aplicative |
+| T02 | Structura `parteneri` | Exact cele 11 coloane contractuale, in ordinea existenta; `cui` INTEGER PK pozitiv |
+| T03 | Structura istoriei | Exact campurile contractuale, FK, rezultat constrans, unicitate si indexuri pentru CUI/rulare/timp |
+| T04 | `init-db` pe cale absenta si repetat | Creeaza directoare/tabele; nu sterge randuri sau istoric existent |
+| T05 | Import CSV valid si diacritice | CUI INTEGER; text normalizat; denumirea initiala ramane independenta |
+| T06 | Duplicate si CUI invalid | Fara randuri duplicate; campuri ANAF pastrate; invalidurile raportate si sarite |
+| T07 | Raspuns `found` valid | Numai cele 9 campuri ANAF se actualizeaza; un istoric `GASIT`; operatie si istoric aceeasi tranzactie |
+| T08 | Raspuns `notFound` | Istoric `NEGASIT`; date ANAF existente neschimbate |
+| T09 | Chei ANAF lipsa/null/gol | `NULL` doar pentru campurile lipsa dintr-un `found` valid; codurile text pastreaza zerourile initiale |
+| T10 | Date structurale lipsa, CUI absent/strain/invalid/duplicat/conflict | `INCOMPLET` pentru CUI-urile cerute afectate; date ANAF nemodificate; anomalii raportate |
+| T11 | HTTP 4xx permanent, 429, 5xx, timeout, conexiune si JSON invalid | `EROARE` pe fiecare CUI si fiecare cerere incercata; retry doar pentru clasele tranzitorii, max. 3 incercari |
+| T12 | Retry al lotului | Fiecare retry adauga un rand per CUI cu `nr_incercare` corect; inregistrarile anterioare nu se rescriu |
+| T13 | Raspuns incomplet | CUI omis/substructura invalida are `INCOMPLET`; rezultatele valide ale celorlalte CUI nu se asociaza gresit |
+| T14 | Istoric peste executii `run` | UUID-uri distincte; toate randurile anterioare se pastreaza |
+| T15 | Eroare dupa o actualizare reusita | Campurile ANAF raman intacte; erorile se adauga numai in istoric |
+| T16 | `--only-missing` | Selecteaza tot si numai CUI-urile cu `denumire_anaf IS NULL`; nu consulta istoricul pentru filtrare |
+| T17 | Limita lot si 101 CUI | Nicio cerere peste 100; 101 CUI implica doua loturi |
+| T18 | 4.000 CUI | 40 loturi fara retry, nu 4.000 cereri individuale |
+| T19 | Pacing | Inceputurile HTTP la minimum 1 secunda, inclusiv retry |
+| T20 | Alte sectiuni din fixture | Nu persista date suplimentare si nu extinde schema |
+| T21 | Erori de conectare/oprire | Continua cu loturile urmatoare; tranzactiile si istoricul deja comise raman valide |
 
-Suita inclusa automatizeaza cazurile esentiale de schema, `init-db`, `import-cui`, mapare, normalizare, `found`, `notFound`, `--only-missing` si transport numai local. Cazurile de failover/pacing la 4.000 CUI pot necesita teste suplimentare ale agentilor; nu se declara trecute fara rulare efectiva.
+## Verificari de rulare
 
-## Verificare dupa codare
-
-```bash
+```text
 python -m unittest discover -s tests -v
+python -m py_compile interogare_anaf/*.py
+python -m interogare_anaf --help
+git diff --check
 ```
 
-Un esec de tip `No module named interogare_anaf` inaintea implementarii este asteptat: baseline-ul nu include codul aplicatiei.
+Testele care necesita un interval real de pacing trebuie sa aiba timeout suficient. Pentru cazurile de volum mare, fixture-ul se poate furniza de serverul local; se verifica numarul efectiv de cereri si continutul lor. Rezultatele se raporteaza separat pentru cazurile care nu au putut fi rulate; nu se declara succes fara executie.
