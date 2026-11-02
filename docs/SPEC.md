@@ -1,123 +1,128 @@
-# SPEC — InterogareAnaf MVP / SQLite (revizia 2026-10-28)
+# SPEC — InterogareAnaf MVP / SQLite (istoric complet)
 
-## 1. Obiectiv si limite de domeniu
+## 1. Obiectiv si limite
 
-Aplicatie de linie de comanda in Python 3.11+ pentru Windows si Ubuntu. Citeste CUI-uri numerice dintr-o baza SQLite si completeaza **doar** campurile alese de utilizator din raspunsul ANAF TVA v9. Aproximativ 4.000 de CUI-uri. Fara aplicatie GUI proprie, fara raport CSV de iesire, fara alte campuri fiscale.
+Aplicatie CLI Python 3.11+ pentru Windows si Ubuntu. Citeste CUI-uri din SQLite, interogheaza ANAF TVA v9 in loturi de cel mult 100 si actualizeaza exclusiv noua campuri ANAF din `parteneri`. Pastreaza fiecare incercare in `istoric_verificari`, fara JSON brut, date personale suplimentare sau secrete. Nu exista GUI proprie, export CSV sau alte campuri fiscale.
 
-**Codex este utilizat din interfata grafica pe Windows**; aceasta alegere nu obliga aplicatia dezvoltata sa aiba GUI. Pe Ubuntu se foloseste OpenCode cu inferenta locala (daca mediul Ollama/OpenCode este deja functional).
+## 2. Persistenta SQLite
 
-Contractul acesta este comun si nu poate fi modificat de cei doi agenti in timpul comparatiei.
+`db/schema.sql` este sursa unica si autoritativa. Schema contine exact doua tabele aplicative: `parteneri` si `istoric_verificari`.
 
-## 2. Persistenta: un singur tabel cu 11 coloane
+### 2.1. `parteneri`
 
-Schema exacta si autoritativa se afla in `db/schema.sql`. Tabela: `parteneri`.
+Pastraza exact cele 11 coloane existente, in ordinea si cu semnificatiile de mai jos. Nu adauga status, timestamp sau coloana de eroare.
 
-| Coloana SQLite | Tip | Sursa | Regula |
-|---|---|---|---|
-| `cui` | `INTEGER PRIMARY KEY` | date initiale; corespondenta cu `date_generale.cui` | CUI pozitiv, unic, fara `RO` |
-| `denumire_initiala` | `TEXT NOT NULL DEFAULT ''` | import initial | Nu se suprascrie la interogarea ANAF |
-| `denumire_anaf` | `TEXT NULL` | `date_generale.denumire` | Normalizeaza diacriticele |
-| `nrRegCom` | `TEXT NULL` | `date_generale.nrRegCom` | Pastreaza formatul ca text |
-| `sdenumire_Localitate` | `TEXT NULL` | `adresa_sediu_social.sdenumire_Localitate` | Text transliterat |
-| `sdenumire_Strada` | `TEXT NULL` | `adresa_sediu_social.sdenumire_Strada` | Text transliterat |
-| `snumar_Strada` | `TEXT NULL` | `adresa_sediu_social.snumar_Strada` | Text; poate contine litere |
-| `scod_Localitate` | `TEXT NULL` | `adresa_sediu_social.scod_Localitate` | Text; pastreaza zerourile de inceput |
-| `sdenumire_Judet` | `TEXT NULL` | `adresa_sediu_social.sdenumire_Judet` | Text transliterat |
-| `sdetalii_Adresa` | `TEXT NULL` | `adresa_sediu_social.sdetalii_Adresa` | Text transliterat; pastreaza punctuatia si spatiile |
-| `scod_Postal` | `TEXT NULL` | `adresa_sediu_social.scod_Postal` | Text; pastreaza zerourile de inceput |
+| Coloana | Tip | Regula |
+|---|---|---|
+| `cui` | `INTEGER PRIMARY KEY` | CUI pozitiv, unic, fara `RO` |
+| `denumire_initiala` | `TEXT NOT NULL DEFAULT ''` | Import initial; nu se suprascrie de raspunsul ANAF |
+| `denumire_anaf` | `TEXT NULL` | `date_generale.denumire` |
+| `nrRegCom` | `TEXT NULL` | `date_generale.nrRegCom`; text |
+| `sdenumire_Localitate` | `TEXT NULL` | localitatea sediului social |
+| `sdenumire_Strada` | `TEXT NULL` | strada sediului social |
+| `snumar_Strada` | `TEXT NULL` | numarul strazii, text |
+| `scod_Localitate` | `TEXT NULL` | cod localitate, text cu zerouri initiale |
+| `sdenumire_Judet` | `TEXT NULL` | judetul sediului social |
+| `sdetalii_Adresa` | `TEXT NULL` | detalii adresa, text |
+| `scod_Postal` | `TEXT NULL` | cod postal, text cu zerouri initiale |
 
-Nu se creeaza alte tabele ori coloane (`status`, `verificat_la`, `data_interogarii`, `eroare`, `platitor_tva` etc.). Este permisa utilizarea de variabile temporare in memorie si afisarea de contoare/erori in consola; nu se persista metadatele.
+`NULL` indica lipsa valorii stocate; valoarea ANAF lipsa sau `""` devine `NULL`. Actualizarea unui element `found` valid seteaza toate cele noua coloane ANAF, iar `denumire_initiala` ramane neschimbata.
 
-`NULL` pentru un camp ANAF indica lipsa unei valori stocate. Un sir gol `""` din raspunsul ANAF este convertit la `NULL`. `denumire_initiala` poate fi `''` cand este cunoscut numai CUI-ul.
+### 2.2. `istoric_verificari`
 
-## 3. Crearea si alimentarea bazei
+Tabel append-only, cu cate un rand pentru fiecare CUI trimis in fiecare cerere efectiva, inclusiv fiecare retry:
 
-`init-db`: creeaza directorul parinte cand lipseste si aplica `db/schema.sql` pe DB indicata; daca baza exista, nu elimina continutul. Se foloseste `sqlite3` din biblioteca standard Python; nu presupunem existenta executabilului `sqlite3` pe Ubuntu.
+| Coloana | Tip / regula |
+|---|---|
+| `id` | `INTEGER PRIMARY KEY` |
+| `cui` | `INTEGER NOT NULL`, FK la `parteneri(cui)` |
+| `rulare_id` | `TEXT NOT NULL`, UUID comun unei executii `run` |
+| `incercat_la` | `TEXT NOT NULL`, timestamp ISO 8601 UTC, terminat in `Z` |
+| `data_interogarii` | `TEXT NOT NULL`, data `YYYY-MM-DD` trimisa catre ANAF |
+| `nr_lot` | `INTEGER NOT NULL`, numerotare de la 1 in executia curenta |
+| `nr_incercare` | `INTEGER NOT NULL`, numerotare de la 1 pentru fiecare lot |
+| `rezultat` | `TEXT NOT NULL`: `GASIT`, `NEGASIT`, `EROARE` sau `INCOMPLET` |
+| `http_status` | `INTEGER NULL`, cod HTTP daca a fost primit |
+| `cod_eroare` | `TEXT NULL`, categorie tehnica sigura |
+| `mesaj_eroare` | `TEXT NULL`, descriere fixa/sanitizata, fara date sensibile |
 
-`import-cui`: comanda **auxiliara de populare initiala**, nu o sursa pentru executarea interogarilor. Citeste UTF-8 sau UTF-8 BOM, separator `;`, antet obligatoriu `cui;denumire_initiala`, 1-4.000+ randuri. `cui` este numai un sir de cifre care se incadreaza intr-un `INTEGER` pozitiv SQLite. Nu se accepta `RO`, cifre fractionare, CUI gol sau valori negative. Se transforma in `int`, se elimina duplicatele prin cheia primara. Importul nu sterge valorile ANAF deja stocate. La conflict pe CUI, un `denumire_initiala` nevid din CSV actualizeaza numai aceasta coloana; sirul gol nu sterge o denumire initiala existenta. Se numara importurile, duplicatele si randurile invalide. Randurile invalide sunt raportate si sarite; numele de firma nu se afiseaza integral in loguri.
+Schema impune rezultate valide, numere pozitive pentru lot/incercare, status HTTP in intervalul 100–599 si unicitate pentru `(rulare_id, cui, nr_lot, nr_incercare)`. Indexurile sustin cautarea dupa CUI si timp, rulare si timp.
 
-Dupa import, executia `run` citeste **exclusiv** `SELECT cui FROM parteneri ORDER BY cui`, nu mai deschide CSV-ul.
+Fiecare `run` genereaza un UUID. Fiecare incercare HTTP genereaza un timestamp UTC comun lotului si o inregistrare pentru fiecare CUI trimis. Pentru un lot de N CUI, un retry inseamna alte N randuri; randurile anterioare nu se actualizeaza sau sterg. Istoricul se pastreaza si intre executii succesive.
 
-## 4. CLI stabil (testabil identic in cele doua variante)
+`init-db` aplica schema idempotent, inclusiv asupra unei baze vechi care contine deja doar `parteneri`; nu sterge si nu recreeaza date sau istoric. `db/schema.sql` nu defineste alte tabele aplicative.
 
-```bash
+## 3. Crearea si importul bazei
+
+`init-db` creeaza directorul parinte lipsa si aplica `db/schema.sql`, folosind exclusiv biblioteca standard `sqlite3`.
+
+`import-cui` este numai pentru popularea initiala. Citeste CSV UTF-8/BOM, separator `;`, cu antet obligatoriu `cui;denumire_initiala`; suporta peste 4.000 randuri. CUI-ul trebuie sa fie sir de cifre ASCII, pozitiv si incadrabil in INTEGER SQLite. Respinge CUI gol, `RO`, negativ, fractionar, cu litere sau depasit. Converteste CUI la `int`, elimina duplicatele prin cheia primara si normalizeaza textul initial.
+
+La conflict, nume initial nevid inlocuieste numai `denumire_initiala`; sirul gol nu sterge numele deja stocat. Importul nu modifica campuri ANAF si nu adauga linii in istoric. Raporteaza numarul randurilor valide importate, duplicate si invalide; nu afiseaza numele firmei in loguri. Randurile invalide se omit.
+
+Dupa import, `run` citeste exclusiv `SELECT cui FROM parteneri ORDER BY cui`. `--only-missing` continua sa selecteze exclusiv randurile cu `denumire_anaf IS NULL`; nu filtreaza pe istoric.
+
+## 4. CLI
+
+```text
 python -m interogare_anaf init-db --db data/private/parteneri.sqlite3
 python -m interogare_anaf import-cui --db data/private/parteneri.sqlite3 --input data/private/parteneri.csv
 python -m interogare_anaf run --db data/private/parteneri.sqlite3 --date 2026-10-28
 python -m interogare_anaf run --db data/private/parteneri.sqlite3 --date 2026-10-28 --only-missing
 ```
 
-Optiuni suplimentare pentru `run`:
+`run` suporta `--api-url URL` (implicit endpointul ANAF), `--timeout SECUNDE` (implicit 20) si `--only-missing`. `--date` este obligatoriu, calendaristic valid si in format strict `YYYY-MM-DD`; aceeasi data se trimite fiecarui CUI din toate loturile. Nici `init-db`, nici `import-cui` nu contacteaza serviciul.
 
-- `--api-url URL`: endpoint configurabil, obligatoriu de suportat pentru testele offline cu server local. Valoarea implicita este endpointul oficial ANAF. Folosirea unui URL non-ANAF este doar pentru testare explicita.
-- `--timeout SECUNDE`: timeout pe cerere (valoare implicita recomandata: 20 secunde).
-- `--only-missing`: selecteaza exclusiv randurile pentru care `denumire_anaf IS NULL`. Fara optiune: reinterogheaza toate CUI-urile, in scop de actualizare.
-- `--date`: data calendaristica reala, in format `YYYY-MM-DD`, obligatorie pentru interogari reproductibile; aceeasi data se trimite pentru fiecare CUI.
+Daca DB lipseste la `run` sau `import-cui`, se afiseaza instructiunea `init-db`; nu se creeaza o schema tacit. Mesajele CLI includ totaluri CUI, loturi, rezultate, erori si anomalii. Nu se persista statistici in afara istoriei definite aici.
 
-Nici `init-db`, nici `import-cui` nu contacteaza ANAF. `run` nu este apelat automat de instalare sau teste; verificarea live este initiata explicit de utilizator.
+## 5. Protocol ANAF TVA v9
 
-## 5. Protocol ANAF
+- Endpoint implicit: `https://webservicesp.anaf.ro/api/PlatitorTvaRest/v9/tva`.
+- HTTP `POST`, `Content-Type: application/json`.
+- Corp: lista de maximum 100 obiecte `{"cui": 57449, "data": "2026-10-28"}`; CUI JSON numeric.
+- CUI-urile se sorteaza si se impart in loturi consecutive de maximum 100; 4.000 CUI inseamna 40 loturi fara retry.
+- Procesare secventiala, cu minimum o secunda intre inceputurile cererilor, inclusiv retry.
+- Maximum 3 incercari totale pe lot. Timeout, eroare de conexiune, HTTP 429 si HTTP 5xx se reincerca cu backoff si `Retry-After` cand exista. HTTP 4xx permanent si JSON invalid nu se reincerca. Limitele de trafic se aplica fiecarui retry.
+- La fiecare cerere efectuata se persista istoricul incercarii pentru fiecare CUI din lot inainte de urmatoarea incercare.
+- Un lot esuat nu sterge date ANAF existente si nu impiedica procesarea loturilor urmatoare. Nicio tranzactie SQLite nu ramane deschisa in timpul asteptarii de retea.
 
-- Endpoint: `https://webservicesp.anaf.ro/api/PlatitorTvaRest/v9/tva`.
-- Metoda: `POST`, `Content-Type: application/json`.
-- Corp: o lista JSON cu obiecte `{"cui": 57449, "data": "2026-10-28"}` (CUI JSON numeric, data text).
-- Maximum **100 CUI** pe cerere; maximum **o cerere/secunda per client**. Se foloseste procesare secventiala, cu interval de minimum 1 secunda intre inceputurile cererilor, inclusiv reincer carile.
-- Sortare dupa CUI si impartire in loturi consecutive de max. 100; pentru 4.000 de CUI => 40 loturi fara reincer cari.
-- Retry pentru timeout, erori de conexiune, HTTP 429 si HTTP 5xx: maximum 3 incercari in total pe lot, cu backoff si `Retry-After` cand e prezent; limitele de trafic se aplica si reincercarilor. HTTP 4xx permanent (exceptie 429) si raspuns JSON invalid sunt erori raportate, fara a compromite celelalte loturi.
-- Un lot esuat nu sterge randuri actualizate anterior. Nu se tine o tranzactie SQLite deschisa in asteptarea retelei.
-- Nu sunt permise apeluri ANAF reale in teste automate sau GitHub Actions.
+URL-ul non-ANAF este destinat exclusiv testelor locale explicite. Testele automate si CI nu acceseaza ANAF real.
 
-Documentatie oficiala ANAF: https://static.anaf.ro/static/10/Anaf/Informatii_R/Servicii_web/doc_WS_V9.txt (instructiuni v9 publicate la 04.02.2025).
+## 6. Interpretarea raspunsului si istoric
 
-## 6. Interpretarea raspunsului
+Top-level `found` si `notFound` trebuie sa fie liste. Un raspuns JSON invalid este eroare de transport/protocol (`EROARE`); raspuns cu structura top-level insuficienta este jurnalizat `INCOMPLET` pentru fiecare CUI al lotului, fara actualizare ANAF.
 
-Exemplul real de referinta primit de la utilizator este `57449.json`. El este **referinta locala**, nu trebuie inclus in repository public. In baseline avem `fixtures/anaf_sintetic.json`, cu forma similara si CUI fictiv.
+Pentru fiecare `found`, se identifica `date_generale.cui`, fara asociere dupa pozitia in lista. CUI-ul trebuie sa fie intreg pozitiv, inclus in lot si unic in `found`. Subobiectele `date_generale` si `adresa_sediu_social` trebuie sa fie obiecte, iar campurile selectate sa fie siruri, null sau absente. Un CUI strain, invalid, duplicat, cu aparitie simultana in ambele liste ori cu substructura de tip gresit nu se aplica. CUI-ul cerut afectat este jurnalizat `INCOMPLET`; anomalia se raporteaza.
 
-Pentru fiecare element din `found`:
+Din `found` se citesc doar `date_generale.denumire`, `date_generale.nrRegCom` si cele sapte chei explicite din `adresa_sediu_social`. Normalizeaza diacriticele romanesti in toate valorile text. Nu preia alte sectiuni. Campurile lipsa, null sau sir gol devin `NULL`; codurile si valorile raman text pentru pastrarea zerourilor initiale.
 
-1. Identifica `date_generale.cui` si verifica faptul ca apare in lotul trimis. Nu asocia randuri dupa ordinea din raspuns.
-2. Citeste doar `date_generale.denumire`, `date_generale.nrRegCom` si cele 7 chei numite explicit din `adresa_sediu_social`.
-3. Converteste diacriticele romanesti in corespondente latine; nu modifica alte informatii si nu elimina punctuatia, cifrele ori spatiile semnificative.
-4. Pe un element `found` valid, actualizeaza atomic **doar** cele 9 coloane ANAF aferente acelui CUI. Daca o cheie lipseste sau contine sir gol, seteaza coloana respectiva la `NULL`. `denumire_initiala` ramane neschimbata.
-5. Daca `date_generale.cui` lipseste, este invalid, nu apare in lot sau este duplicat intr-un raspuns, ignora acele elemente si raporteaza anomalie. Daca subobiectele necesare sunt de tip gresit, ignora elementul, nu scrie valori arbitrare.
+Clasificarea pe CUI pentru fiecare raspuns HTTP valid:
 
-Pentru `notFound`: identifica CUI-urile returnate, raporteaza numarul lor si **nu modifica** datele ANAF deja existente. Nu considera `notFound` drept rezultat negativ fiscal si nu adauga o coloana de status.
+- `found` valid si neambiguu: `GASIT`; actualizeaza cele noua campuri ANAF si insereaza istoricul corespunzator in aceeasi tranzactie SQLite.
+- `notFound` valid si unic: `NEGASIT`; nu modifica nicio valoare ANAF existenta.
+- CUI lipsa din ambele liste, afectat de anomalie sau cu structura insuficienta: `INCOMPLET`; nu modifica date ANAF.
+- Timeout, conexiune, HTTP 429/5xx, HTTP 4xx permanent ori JSON invalid: `EROARE` pentru fiecare CUI al cererii, cu HTTP status daca exista, cod de categorie si mesaj sigur.
 
-Pentru CUI-uri care lipsesc simultan din `found` si `notFound`, raporteaza raspunsul incomplet; nu actualizeaza randurile respective. Nu procesa campuri necerute (`adresa`, `codPostal`, `adresa_domiciliu_fiscal`, `inregistrare_scop_Tva`, `stare_inactiv`, `RO e-Factura`, etc.). Daca raspunsul este eronat sau incomplet ca structura, nu suprascrie datele anterioare ale lotului.
+Un retry are alte randuri de istoric cu acelasi `rulare_id`/`nr_lot` si `nr_incercare` incrementat. Rezultatul final gasit/negasit/incomplet se jurnalizeaza si el pentru incercarea care a returnat raspunsul JSON. O executie urmatoare adauga randuri noi, nu rescrie istoricul.
 
-### Consecinta explicita a schemei fara status
+## 7. Normalizarea textului
 
-Nu putem deosebi persistent un CUI niciodata interogat de unul prezent in `notFound`, deoarece nu avem coloane de stare/date. `--only-missing` reinterogheaza randurile pentru care `denumire_anaf IS NULL`, inclusiv `notFound` si `found` fara denumire. Nu putem deduce din SQLite *cand* s-a efectuat ultima verificare. Aceste limitari sunt **acceptate pentru MVP**, ca sa respectam cerinta celor 11 coloane.
-
-## 7. Normalizarea diacriticelor
-
-Obligatoriu pentru **toate** campurile text inserate/actualizate, inclusiv `denumire_initiala` la import:
-
-`ă→a`, `Ă→A`, `â→a`, `Â→A`, `î→i`, `Î→I`, `ș/ş→s`, `Ș/Ş→S`, `ț/ţ→t`, `Ț/Ţ→T`.
-
-Se poate folosi `unicodedata.normalize('NFD', value)` urmat de eliminarea semnelor combinatorii pentru caracterele romanesti (sau o mapare explicita), fara a distruge alte simboluri. Nu se impune conversie la uppercase, eliminarea dublelor spatii sau schimbarea punctuatiei.
-
-Exemplu din fisierul real: `ÎN INCINTA PARCULUI ȘTIINȚIFIC ȘI TEHNOLOGIC  BIHOR. SPAȚIU BIROU NR. 1.11` devine `IN INCINTA PARCULUI STIINTIFIC SI TEHNOLOGIC  BIHOR. SPATIU BIROU NR. 1.11`.
+Pentru toate campurile text importate ori actualizate: `ă/Ă→a/A`, `â/Â→a/A`, `î/Î→i/I`, `ș/ş/Ș/Ş→s/S`, `ț/ţ/Ț/Ţ→t/T`. Nu modifica alte simboluri, punctuatia, cifrele sau spatiile semnificative; nu schimba literele in uppercase si nu comprima spatiile.
 
 ## 8. Siguranta si rezilienta
 
-- SQL numai cu parametri la import si UPDATE, niciodata concatenare de valori.
-- DB in `data/private/parteneri.sqlite3`, ignorata de Git; acelasi lucru pentru orice backup sau fisiere SQLite WAL/SHM.
-- Inainte de verificarea live, utilizatorul efectueaza backup SQLite (se recomanda API-ul `sqlite3.Connection.backup`).
-- Un proces de interogare pe DB odata; nu sunt necesare thread-uri multiple pentru API.
-- Inchidere controlata la Ctrl+C: loturile deja salvate raman, cele neterminate raman neatinse.
-- Daca DB nu exista la `run` sau `import-cui`, afiseaza o eroare clara cu instructiunea `init-db` (nu crea tacit un tabel gresit).
-- Mesaje CLI cu total CUI citite, loturi procesate, CUI gasite, negasite, raspunsuri incomplete si loturi esuate; fara persistarea acestora in tabel.
-- `run` trebuie sa poata fi repetat in siguranta. Datele obtinute cu succes sunt suprascrise doar in coloanele ANAF, pastrand denumirea initiala.
+- SQL parametrizat la import, actualizare si istoric.
+- Baza si fisierele SQLite/WAL/SHM locale raman ignorate de Git.
+- Inainte de utilizarea cu date reale se face backup SQLite; dezvoltarea si testele nu acceseaza bazele reale.
+- Un singur proces `run` pe DB; nu sunt necesare thread-uri multiple pentru clientul ANAF.
+- Ctrl+C pastreaza actualizarile si istoricul tranzactiilor deja comise; lotul neterminat ramane fara date inventate.
+- Datele ANAF nu se sterg la `notFound`, erori sau raspunsuri incomplete.
+- Nu se persista corpul JSON integral, date fiscale necerute, date personale, credentiale sau eccezioni brute.
 
 ## 9. Testare si acceptanta
 
-Se executa suita de acceptanta comuna `python -m unittest discover -s tests -v` si testele suplimentare implementate de fiecare agent; nu se modifica testele comune. Serverul HTTP de test asculta numai pe `127.0.0.1`; nu se contacteaza ANAF in teste.
+`python -m unittest discover -s tests -v` trebuie sa fie offline. Serverele simulatate asculta numai pe `127.0.0.1`; se folosesc fixture-uri fictive si network guard impotriva hosturilor externe.
 
-Cazuri obligatorii: schema cu exact 11 coloane; import/duplicate/CUI invalid; doua denumiri independente; parsare `found` si `notFound`; nume si adrese cu diacritice; coduri cu zerouri; lipsa de campuri; erori HTTP 429/5xx/timeout/JSON invalid; loturi de max. 100 si pacing de max. 1 request/s; procesare continua cand un lot esueaza; reintrare `--only-missing`; raspuns cu CUI strain in `found`; 4.000 CUI fara a depasi limitele.
+Verifica cele doua tabele si coloanele exacte, init idempotent, import/duplicate/CUI invalid, normalizare, campuri lipsa, `GASIT`/`NEGASIT`/`EROARE`/`INCOMPLET`, istoric append-only intre executii, un rand pentru fiecare CUI la fiecare incercare, retry/backoff/pacing, raspunsuri HTTP si JSON invalide, raspunsuri incomplete/duplicate/straine, pastrarea datelor ANAF la erori, `--only-missing`, loturi max 100 si 4.000 CUI in 40 loturi.
 
-Doi agenti primesc acelasi baseline, aceeasi data de test, acelasi prompt si aceleasi teste; nu se executa merge intre ramuri inaintea evaluarii.
-
-## 10. In afara scopului
-
-Nu exista UI proprie, CSV export, coloane fiscale TVA/e-Factura, campuri din adresa domiciliului fiscal, audit istoric, rulare programata, acces concurent la DB sau integrare cu sisteme interne.
+Niciun test nu contacteaza serviciul ANAF real.
