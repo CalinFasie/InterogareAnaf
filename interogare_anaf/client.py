@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import json
+import math
 import time
 from typing import Callable
 from urllib.error import HTTPError, URLError
@@ -14,6 +15,7 @@ from .normalization import normalize_text
 DEFAULT_API_URL = "https://webservicesp.anaf.ro/api/PlatitorTvaRest/v9/tva"
 MAX_BATCH_SIZE = 100
 MAX_ATTEMPTS = 3
+MAX_SQLITE_INTEGER = 2**63 - 1
 _FIELD_MAP = (
     ("date_generale", "denumire", 0),
     ("date_generale", "nrRegCom", 1),
@@ -39,6 +41,14 @@ class RequestPacer:
     """Keep request start times at least one second apart per client."""
 
     def __init__(self, interval: float = 1.1, clock=time.monotonic, sleeper=time.sleep):
+        if isinstance(interval, bool):
+            raise ValueError("Intervalul dintre cereri trebuie sa fie finit si de cel putin o secunda")
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Intervalul dintre cereri trebuie sa fie finit si de cel putin o secunda") from exc
+        if not math.isfinite(interval) or interval < 1.0:
+            raise ValueError("Intervalul dintre cereri trebuie sa fie finit si de cel putin o secunda")
         self.interval = interval
         self.clock = clock
         self.sleeper = sleeper
@@ -58,7 +68,10 @@ def _retry_after_seconds(value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            return None
+        return max(0.0, seconds)
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value)
@@ -71,7 +84,7 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 @dataclass(frozen=True)
 class BatchResponse:
-    payload: dict
+    payload: object
     attempts: int
     http_status: int | None
     attempted_at: str
@@ -98,8 +111,15 @@ class CuiOutcome:
 class AnafClient:
     def __init__(self, api_url: str = DEFAULT_API_URL, timeout: float = 20.0,
                  opener=urlopen, pacer: RequestPacer | None = None):
+        try:
+            timeout_value = float(timeout)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Timeout-ul trebuie sa fie finit si pozitiv") from exc
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or \
+                not math.isfinite(timeout_value) or timeout_value <= 0:
+            raise ValueError("Timeout-ul trebuie sa fie finit si pozitiv")
         self.api_url = api_url
-        self.timeout = timeout
+        self.timeout = timeout_value
         self.opener = opener
         self.pacer = pacer or RequestPacer()
         self.request_count = 0
@@ -112,6 +132,15 @@ class AnafClient:
               on_error_attempt: Callable[[AttemptEvent], None] | None = None) -> BatchResponse:
         if not cuis or len(cuis) > MAX_BATCH_SIZE:
             raise ValueError("Lotul trebuie sa contina intre 1 si 100 CUI")
+        if any(isinstance(cui, bool) or not isinstance(cui, int) or
+               cui <= 0 or cui > MAX_SQLITE_INTEGER for cui in cuis):
+            raise ValueError("CUI-urile trebuie sa fie INTEGER SQLite pozitive")
+        try:
+            parsed_date = datetime.strptime(query_date, "%Y-%m-%d").date()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Data trebuie sa fie valida si in format YYYY-MM-DD") from exc
+        if parsed_date.isoformat() != query_date:
+            raise ValueError("Data trebuie sa fie valida si in format YYYY-MM-DD")
         body = json.dumps(
             [{"cui": cui, "data": query_date} for cui in cuis],
             separators=(",", ":"),
@@ -142,12 +171,6 @@ class AnafClient:
                         "Raspunsul ANAF nu este JSON valid.",
                     ))
                     raise RequestFailure("raspuns JSON invalid") from exc
-                if not isinstance(payload, dict):
-                    self._notify_error(on_error_attempt, AttemptEvent(
-                        attempt, attempted_at, "EROARE", http_status, "JSON_INVALID",
-                        "Raspunsul ANAF nu este obiect JSON valid.",
-                    ))
-                    raise RequestFailure("raspuns JSON invalid")
                 return BatchResponse(payload, attempt, http_status, attempted_at)
             except HTTPError as exc:
                 retryable = exc.code == 429 or 500 <= exc.code <= 599
@@ -212,8 +235,10 @@ def _valid_cui(value: object) -> int | None:
     return value
 
 
-def apply_payload(requested: list[int], payload: dict) -> ApplyResult:
+def apply_payload(requested: list[int], payload: object) -> ApplyResult:
     """Classify response entries without writing data; caller persists outcomes atomically."""
+    if not isinstance(payload, dict):
+        raise ProtocolFailure("raspuns fara obiect JSON la nivel superior")
     if not isinstance(payload.get("found"), list) or not isinstance(payload.get("notFound"), list):
         raise ProtocolFailure("raspuns fara liste found si notFound valide")
 
